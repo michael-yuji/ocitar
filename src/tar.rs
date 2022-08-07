@@ -205,6 +205,7 @@ impl RawTarHeader
         self.is_valid_tar_header() && self.ustar == *b"ustar\0"
     }
 
+    #[allow(dead_code)]
     pub fn is_extension(&self) -> bool {
         self.is_ustar_header() && (self.tpe[0] == b'x' || self.tpe[0] == b'g')
     }
@@ -260,8 +261,8 @@ impl Extension {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Summary {
-    files: Vec<String>,
-    whiteouts: Vec<String>
+    pub files: Vec<String>,
+    pub whiteouts: Vec<String>
 }
 
 pub fn remove_path(p: std::path::PathBuf) -> std::io::Result<()>
@@ -330,207 +331,189 @@ pub fn tap_create_tar<R: Read, W: Write>(
     Ok(())
 }
 
+trait TarEntryHandle {
+    fn on_whiteout_extension(&mut self, extension: WhiteoutExtension) -> std::io::Result<()>;
+    fn on_oci_whiteout_entry(&mut self, path: std::path::PathBuf) -> std::io::Result<()>;
+    fn on_oci_whiteout_opq(&mut self, path: std::path::PathBuf) -> std::io::Result<()>;
+    fn on_empty_records(&mut self) -> std::io::Result<()>;
+    fn on_normal_entry(&mut self, buf: &[u8;512], header: &RawTarHeader) -> std::io::Result<()>;
+    fn on_normal_entry_block(&mut self, buf: &[u8;512], header: &RawTarHeader) -> std::io::Result<()>;
+    fn on_tailing_record(&mut self, buf: &[u8]) -> std::io::Result<()>;
+}
 
-// read from a tar and pass to stdin of a real tar process
-pub fn tap_extract_tar<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+struct ListTar {
+    summary: Summary
+}
+
+impl TarEntryHandle for ListTar {
+    fn on_whiteout_extension(&mut self, extension: WhiteoutExtension) -> std::io::Result<()> {
+        for whiteout in extension.whiteouts {
+            self.summary.whiteouts.push(whiteout);
+        }
+        Ok(())
+    }
+
+    fn on_oci_whiteout_entry(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
+        self.summary.whiteouts.push(path.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    fn on_oci_whiteout_opq(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
+        self.summary.whiteouts.push(format!("{}/*", path.to_string_lossy()));
+        Ok(())
+    }
+
+    fn on_empty_records(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn on_normal_entry(&mut self, _buf: &[u8;512], header: &RawTarHeader) -> std::io::Result<()> {
+        self.summary.files.push(header.file_path()?.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    fn on_normal_entry_block(&mut self, _buf: &[u8;512], _header: &RawTarHeader) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn on_tailing_record(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct ExtractTar<W> {
+    writer: W
+}
+
+impl<W: Write> TarEntryHandle for ExtractTar<W> {
+    fn on_whiteout_extension(&mut self, extension: WhiteoutExtension) -> std::io::Result<()> {
+        for whiteout in extension.whiteouts {
+            remove_path(std::path::PathBuf::from(whiteout))?;
+        }
+        Ok(())
+    }
+
+    fn on_oci_whiteout_entry(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
+        remove_path(path)
+    }
+
+    fn on_oci_whiteout_opq(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
+        for dirent in std::fs::read_dir(path)? {
+            let path = dirent?.path();
+            remove_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn on_empty_records(&mut self) -> std::io::Result<()> {
+        self.writer.write_all(&EMPTY_TAR_HEADER)
+    }
+
+    fn on_normal_entry(&mut self, buf: &[u8;512], _header: &RawTarHeader) -> std::io::Result<()> {
+        self.writer.write_all(buf)
+    }
+
+    fn on_normal_entry_block(&mut self, buf: &[u8;512], _header: &RawTarHeader) -> std::io::Result<()> {
+        self.writer.write_all(buf)
+    }
+
+    fn on_tailing_record(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(buf)
+    }
+}
+
+fn tap_foreach_entry<R: Read, H: TarEntryHandle>(reader: &mut R, handle: &mut H) -> std::io::Result<()>
 {
-    // tar files ends with 2 or more continuous empty records
+    let mut entries_count = 0;
     let mut empty_records = 0;
     let mut buf = [0u8; 512];
 
+    let mut reader: Box<dyn Read> = Box::new(reader);
+
     loop {
-        log::debug!("reading next entry");
+        eprintln!("begin reading etry {{entries_count}}");
+
+        log::debug!("reading {entries_count} entry");
         reader.read_exact(&mut buf)?;
-        log::trace!("finished reading entry");
+        log::trace!("finished reading entry ({entries_count})");
+        eprintln!("finished reading etry {{entries_count}}");
+
+        entries_count += 1;
 
         let header = unsafe { std::mem::transmute::<[u8;512], RawTarHeader>(buf) };
 
         if header.is_valid_tar_header() {
-            // reset empty record counter as we encountered a vaild tar header
             empty_records = 0;
             let content_length = header.content_length()?;
-            let blocks = (content_length + 511)/512;
+            let blocks = ((content_length + 511)/512) as usize;
 
             if header.is_whiteout_extension() {
-                log::debug!("encountered whiteout extension");
-                // read the extension details
-                let extensions = Extension::read_from_stream(reader, content_length as usize)?;
-
+                log::debug!("entry is whiteout extension");
+                let extensions = Extension::read_from_stream(&mut reader, content_length as usize)?;
                 for extension in extensions.iter() {
-                    if extension.key == *"whiteouts".to_string() {
-                        let meta: WhiteoutExtension = serde_json::from_str(&extension.value).unwrap();
-                        for path in meta.whiteouts {
-                            log::info!("whiteout(ext): {path}");
-                            remove_path(std::path::PathBuf::from(path))?;
-                        }
-                    }
+                    let ext: WhiteoutExtension = serde_json::from_str(&extension.value).unwrap();
+                    handle.on_whiteout_extension(ext)?;
                 }
             } else {
                 let path = header.file_path()?;
                 let filename = path.file_name().unwrap().to_str().unwrap();
 
                 if let Some(name) = filename.strip_prefix(".wh.") {
-                    log::debug!("encountered oci whiteout file: {filename}");
                     if name == ".wh..opq" {
-
-                        /*
-                        let parent = match path.parent() {
-                            Some(parent) => {
-                                eprintln!("some:parent:({})", parent.to_string_lossy());
-                                parent.to_path_buf()}
-                            ,
-                            None => std::path::PathBuf::from(".")
-                        };
-                        */
-
                         let mut parent = path.parent().unwrap().to_path_buf();
                         if parent.to_string_lossy() == "" {
-                            parent  = std::path::PathBuf::from(".")
+                            parent = std::path::PathBuf::from(".")
                         }
-
-                        log::info!("whiteout(oci): {}/*", parent.to_string_lossy());
-
-                        for dirent in std::fs::read_dir(parent)? {
-
-                            let path = dirent?.path();
-                            remove_path(path)?;
-                        }
+                        handle.on_oci_whiteout_opq(parent)?;
                     } else {
                         let to_delete = match path.parent() {
                             Some(parent) => parent.join(&name),
                             None => std::path::PathBuf::from(name)
                         };
-
-                        log::info!("whiteout(oci): {}", to_delete.to_string_lossy());
-                        remove_path(to_delete)?;
-                    }
-
-                    log::debug!("skipping {blocks} whiteout file content");
-                    for _ in 0..blocks {
-                        reader.read_exact(&mut buf)?;
+                        handle.on_oci_whiteout_entry(to_delete)?;
                     }
                 } else {
-                    log::info!("extracting: {}", header.file_path()?.to_string_lossy());
-                    writer.write_all(&buf)?;
-                    log::debug!("written file header");
-                    for i in 0..blocks {
+                    handle.on_normal_entry(&buf, &header)?;
+                    // it doesn't matter if the entry is a pax entension, if we don't
+                    // know how to handle it we pass it downstream to tar
+                    for _ in 0..blocks {
                         reader.read_exact(&mut buf)?;
-                        log::debug!("finished reading file content block {}", i);
-                        writer.write_all(&buf)?;
-                        log::debug!("written block {}", i);
+                        handle.on_normal_entry_block(&buf, &header)?;
                     }
                 }
             }
         } else if buf == EMPTY_TAR_HEADER {
-            log::debug!("empty block encountered");
             empty_records += 1;
-            writer.write_all(&buf)?;
-
+            eprintln!("empty_records: {empty_records}");
+            handle.on_empty_records()?;
             if empty_records == 2 {
+                loop {
+                    let n = reader.read(&mut buf)?;
+                    handle.on_tailing_record(&buf[0..n])?;
+                    if n == 0 {
+                        break
+                    }
+                }
                 break;
             }
         } else {
             return err!("unknown format");
         }
     }
-
-    // write everything to tar
-    loop {
-        let n = reader.read(&mut buf)?;
-        writer.write_all(&buf[0..n])?;
-        if n == 0 {
-            break
-        }
-    }
-
     Ok(())
+}
+
+// read from a tar and pass to stdin of a real tar process
+pub fn tap_extract_tar<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+{
+    let mut extractor = ExtractTar { writer };
+    tap_foreach_entry(reader, &mut extractor)
 }
 
 pub fn list_tar<R: Read>(reader: &mut R) -> std::io::Result<Summary>
 {
-    // until RFC 1210 is stable we are stuck with this
-    fn seek<R: Read>(reader: &mut R, buf: &mut [u8;512], blocks: u128) -> std::io::Result<()> {
-        for _ in 0..blocks {
-            reader.read_exact(buf)?;
-        }
-        Ok(())
-    }
-
-    let mut files = vec![];
-    let mut whiteouts = vec![];
-    let mut buf = [0u8; 512];
-    let mut empty_records = 0;
-
-    loop {
-        log::debug!("reading next entry");
-        reader.read_exact(&mut buf)?;
-        log::trace!("finished reading entry");
-
-        let header = unsafe { std::mem::transmute::<[u8;512], RawTarHeader>(buf) };
-        log::trace!("header: {header:x?}");
-
-        if header.is_valid_tar_header() {
-            // reset empty records counter
-            empty_records = 0;
-
-            let content_length = header.content_length()?;
-            let blocks = (content_length + 511) / 512;
-
-            if header.is_whiteout_extension() {
-                log::debug!("encountered whiteout extension");
-                // read the extension details
-                let extensions = Extension::read_from_stream(reader, content_length as usize)?;
-                log::trace!("extensions: {extensions:?}");
-
-                for extension in extensions.iter() {
-                    if extension.key == *"whiteouts".to_string() {
-                        let meta: WhiteoutExtension = serde_json::from_str(&extension.value).unwrap();
-                        whiteouts.extend(meta.whiteouts)
-                    }
-                }
-            } else if header.is_extension() {
-                log::debug!("skiping pax header and its content ({blocks} blocks)");
-                // skip the pax entension records
-                seek(reader, &mut buf, blocks)?;
-            } else {
-
-                let path = header.file_path()?;
-                let filename = path.file_name().unwrap().to_str().unwrap();
-
-                log::debug!("entry is file: {:?}", path.to_string_lossy());
-
-                // OCI layer whiteout files
-                if let Some(name) = filename.strip_prefix(".wh.") {
-                    if name == ".wh..opq" {
-                        whiteouts.push(path.to_string_lossy().to_string());
-                    } else {
-                        let path = match path.parent() {
-                            Some(parent) => parent.join(name),
-                            None => std::path::PathBuf::from(name)
-                        };
-
-                        whiteouts.push(path.to_string_lossy().to_string());
-                    }
-                } else {
-                    files.push(path.to_string_lossy().to_string());
-                }
-
-                log::debug!("skiping file blocks ({blocks} blocks)");
-                seek(reader, &mut buf, blocks)?;
-            }
-        } else if buf == EMPTY_TAR_HEADER {
-            log::debug!("encountered empty tar header ({empty_records})");
-            empty_records += 1;
-            if empty_records == 2 {
-                log::trace!("break from list loop");
-                break;
-            }
-        } else {
-            return err!("Unknown format")
-        }
-    }
-
-    Ok(Summary { files, whiteouts })
+    let mut lister = ListTar { summary: Summary { files: vec![], whiteouts: vec![] } };
+    tap_foreach_entry(reader, &mut lister)?;
+    Ok(lister.summary)
 }
 
 pub fn write_extended_header<W: Write>(writer: &mut W, key: &str, value: &str) -> std::io::Result<usize>
