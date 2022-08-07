@@ -6,57 +6,8 @@ use clap::{Parser, Subcommand};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::Command;
-use zstd::Encoder;
+use zstd::{Decoder, Encoder};
 
-fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
-{
-    let mut input: Box<dyn Read> = match args.file.as_str() {
-        "-" => Box::new(std::io::stdin()),
-        path => Box::new(File::open(path)?)
-    };
-
-    if let Some(dir) = args.chdir {
-        std::env::set_current_dir(dir)?;
-    }
-
-    extract(&mut input)
-}
-
-fn extract<R: Read>(reader: &mut R) -> Result<(), std::io::Error>
-{
-    let mut child = Command::new("tar").arg("-xf-").stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    let tar_stdin = child.stdin.as_mut().unwrap();
-
-    tar::tap_extract_tar(reader, tar_stdin)?;
-
-    match child.wait()?.code() {
-        Some(ec) if ec != 0 => {
-            err!("tar return non-zero exit code")
-        },
-        _ => Ok(())
-    }
-}
-
-fn create_tar<W: Write>(
-    without_oci: bool, without_ext: bool, 
-    paths: &[String], whiteouts: &[String], output: &mut W) -> Result<(), std::io::Error>
-{
-    let mut child = Command::new("tar").arg("-cf-").args(paths)
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-    let tar_stdout = child.stdout.as_mut().unwrap();
-
-    tar::tap_create_tar(without_oci, without_ext, whiteouts, tar_stdout, output)?;
-
-    match child.wait()?.code() {
-        Some(code) if code != 0 => {
-            err!("tar returns non-zero exit code")
-        },
-        _ => Ok(())
-    }
-}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -117,6 +68,7 @@ struct ExtractArgs {
     #[clap(short = 'C')]
     chdir: Option<String>,
 
+    #[clap(short)]
     /// path to the archive file or '-' for stdin
     file: String
 }
@@ -131,13 +83,27 @@ enum Commands {
     Extract(ExtractArgs)
 }
 
-fn do_list(args: ListArgs) -> Result<(), std::io::Error> {
-    let summary = match args.file.as_str() {
-        "-" => tar::list_tar(&mut std::io::stdin()),
-        path => tar::list_tar(&mut File::open(path)?)
-    }?;
+fn do_list(args: ListArgs) -> Result<(), std::io::Error>
+{
+    let mut input: Box<dyn Read> = match args.file.as_str() {
+        "-" => Box::new(std::io::stdin()),
+        path => Box::new(File::open(path)?)
+    };
 
-    println!("{summary:#?}");
+    if args.zstd {
+        input = Box::new(Decoder::new(input)?);
+    }
+
+    let summary = tar::list_tar(&mut input)?;
+
+    for whiteout in summary.whiteouts.iter() {
+        println!("-\t{whiteout}");
+    }
+
+    for file in summary.files.iter() {
+        println!("+\t{file}");
+    }
+
     Ok(())
 }
 
@@ -154,6 +120,61 @@ fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
 
     create_tar(args.without_oci, args.without_ext, &args.paths, &args.remove, &mut output)
 }
+
+fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
+{
+    let mut input: Box<dyn Read> = match args.file.as_str() {
+        "-" => Box::new(std::io::stdin()),
+        path => Box::new(File::open(path)?)
+    };
+
+    if args.zstd {
+        input = Box::new(Decoder::new(input)?);
+    }
+
+    if let Some(dir) = args.chdir {
+        std::env::set_current_dir(dir)?;
+    }
+
+    extract(&mut input)
+}
+
+fn extract<R: Read>(reader: &mut R) -> Result<(), std::io::Error>
+{
+    let mut child = Command::new("tar").arg("-xf-").stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    let tar_stdin = child.stdin.as_mut().unwrap();
+
+    tar::tap_extract_tar(reader, tar_stdin)?;
+
+    match child.wait()?.code() {
+        Some(ec) if ec != 0 => {
+            err!("tar return non-zero exit code")
+        },
+        _ => Ok(())
+    }
+}
+
+fn create_tar<W: Write>(
+    without_oci: bool, without_ext: bool, 
+    paths: &[String], whiteouts: &[String], output: &mut W) -> Result<(), std::io::Error>
+{
+    let mut child = Command::new("tar").arg("-cf-").args(paths)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let tar_stdout = child.stdout.as_mut().unwrap();
+
+    tar::tap_create_tar(without_oci, without_ext, whiteouts, tar_stdout, output)?;
+
+    match child.wait()?.code() {
+        Some(code) if code != 0 => {
+            err!("tar returns non-zero exit code")
+        },
+        _ => Ok(())
+    }
+}
+
 
 fn main() -> Result<(), std::io::Error> {
     // to not ignore SIGPIPE so cli can run properly when piped
