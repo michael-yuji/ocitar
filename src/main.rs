@@ -1,13 +1,14 @@
 mod util;
 mod tar;
 
-use crate::util::*;
 use clap::{Parser, Subcommand};
+use crate::util::*;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::Command;
 use zstd::{Decoder, Encoder};
 
+const ZSTD_MAGIC: [u8;4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -18,8 +19,19 @@ struct Args {
     command: Commands
 }
 
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    #[clap(short_flag = 'c')]
+    Create(CreateArgs),
+    #[clap(short_flag = 't')]
+    List(ListArgs),
+    #[clap(short_flag = 'x')]
+    Extract(ExtractArgs)
+}
+
 #[derive(Parser, Debug)]
-struct CreateArgs
+pub struct CreateArgs
 {
     /// path to the output file, or '-' for stdout
     #[clap(short = 'f', long)]
@@ -47,7 +59,7 @@ struct CreateArgs
 }
 
 #[derive(Parser, Debug)]
-struct ListArgs {
+pub struct ListArgs {
     /// path to the tar file, or '-' for stdin
     #[clap(short)]
     file: String,
@@ -58,7 +70,7 @@ struct ListArgs {
 }
 
 #[derive(Parser, Debug)]
-struct ExtractArgs {
+pub struct ExtractArgs {
 
     /// use if the archive is zstd compressed
     #[clap(long)]
@@ -73,17 +85,7 @@ struct ExtractArgs {
     file: String
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    #[clap(short_flag = 'c')]
-    Create(CreateArgs),
-    #[clap(short_flag = 't')]
-    List(ListArgs),
-    #[clap(short_flag = 'x')]
-    Extract(ExtractArgs)
-}
-
-fn do_list(args: ListArgs) -> Result<(), std::io::Error>
+pub fn do_list(args: ListArgs) -> Result<(), std::io::Error>
 {
     let mut input: Box<dyn Read> = match args.file.as_str() {
         "-" => Box::new(std::io::stdin()),
@@ -92,6 +94,14 @@ fn do_list(args: ListArgs) -> Result<(), std::io::Error>
 
     if args.zstd {
         input = Box::new(Decoder::new(input)?);
+    } else {
+        let mut check_magic = [0u8; 4];
+        input.read_exact(&mut check_magic)?;
+        if check_magic == ZSTD_MAGIC {
+            input = Box::new(Decoder::new(PrebufferedSource::new(&check_magic, input))?);
+        } else {
+            input = Box::new(PrebufferedSource::new(&check_magic, input));
+        }
     }
 
     let summary = tar::list_tar(&mut input)?;
@@ -107,7 +117,7 @@ fn do_list(args: ListArgs) -> Result<(), std::io::Error>
     Ok(())
 }
 
-fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
+pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
 
     let mut output: Box<dyn Write> = match args.file.as_str() {
         "-" => Box::new(std::io::stdout()),
@@ -121,7 +131,7 @@ fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
     create_tar(args.without_oci, args.without_ext, &args.paths, &args.remove, &mut output)
 }
 
-fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
+pub fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
 {
     let mut input: Box<dyn Read> = match args.file.as_str() {
         "-" => Box::new(std::io::stdin()),
@@ -130,12 +140,20 @@ fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
 
     if args.zstd {
         input = Box::new(Decoder::new(input)?);
+    } else {
+        let mut check_magic = [0u8; 4];
+        input.read_exact(&mut check_magic)?;
+        if check_magic == ZSTD_MAGIC {
+            input = Box::new(Decoder::new(PrebufferedSource::new(&check_magic, input))?);
+        } else {
+            input = Box::new(PrebufferedSource::new(&check_magic, input));
+        }
     }
 
     if let Some(dir) = args.chdir {
         std::env::set_current_dir(dir)?;
     }
-
+println!("148");
     extract(&mut input)
 }
 
@@ -196,5 +214,75 @@ fn main() -> Result<(), std::io::Error> {
         Commands::Extract(c) => do_extract(c)?
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_extract_auto_zstd() {
+        let current_dir = std::env::current_dir().unwrap();
+        _ = std::fs::remove_dir_all("test-materials/stagez");
+
+        let result = std::panic::catch_unwind(|| {
+            println!("{}", std::env::current_dir().unwrap().to_string_lossy());
+            std::process::Command::new("cp").arg("-r")
+                .arg("test-materials/stage_template")
+                .arg("test-materials/stagez")
+                .output().unwrap();
+            let extract_arg = ExtractArgs { chdir: Some("test-materials/stagez".to_string())
+                                          , file: "test-materials/base.tar.zst".to_string()
+                                          , zstd: false };
+            do_extract(extract_arg).unwrap();
+
+            let output = std::process::Command::new("diff").arg("-r")
+                .arg("../stagez")
+                .arg("../stage-expected").output().unwrap();
+            println!("stdout: {:?}", std::str::from_utf8(&output.stdout));
+            println!("stderr: {:?}", std::str::from_utf8(&output.stderr));
+
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+        });
+
+        _ = std::env::set_current_dir(current_dir);
+        _ = std::fs::remove_dir_all("test-materials/stagez");
+        assert!(result.is_ok())
+    }
+
+    #[test]
+    #[serial]
+    fn test_extract() {
+        let current_dir = std::env::current_dir().unwrap();
+        _ = std::fs::remove_dir_all("test-materials/stage");
+
+        let result = std::panic::catch_unwind(|| {
+            println!("{}", std::env::current_dir().unwrap().to_string_lossy());
+            std::process::Command::new("cp").arg("-r")
+                .arg("test-materials/stage_template")
+                .arg("test-materials/stage")
+                .output().unwrap();
+            let extract_arg = ExtractArgs { chdir: Some("test-materials/stage".to_string())
+                                          , file: "test-materials/base.tar".to_string()
+                                          , zstd: false };
+            do_extract(extract_arg).unwrap();
+
+            let output = std::process::Command::new("diff").arg("-r")
+                .arg("../stage")
+                .arg("../stage-expected").output().unwrap();
+            println!("stdout: {:?}", std::str::from_utf8(&output.stdout));
+            println!("stderr: {:?}", std::str::from_utf8(&output.stderr));
+
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+        });
+
+        _ = std::env::set_current_dir(current_dir);
+        _ = std::fs::remove_dir_all("test-materials/stage");
+        assert!(result.is_ok())
+    }
 }
 
