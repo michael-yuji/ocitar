@@ -430,12 +430,9 @@ fn tap_foreach_entry<R: Read, H: TarEntryHandle>(reader: &mut R, handle: &mut H)
     let mut reader: Box<dyn Read> = Box::new(reader);
 
     loop {
-        eprintln!("begin reading etry {{entries_count}}");
-
         log::debug!("reading {entries_count} entry");
         reader.read_exact(&mut buf)?;
         log::trace!("finished reading entry ({entries_count})");
-        eprintln!("finished reading etry {{entries_count}}");
 
         entries_count += 1;
 
@@ -483,7 +480,6 @@ fn tap_foreach_entry<R: Read, H: TarEntryHandle>(reader: &mut R, handle: &mut H)
             }
         } else if buf == EMPTY_TAR_HEADER {
             empty_records += 1;
-            eprintln!("empty_records: {empty_records}");
             handle.on_empty_records()?;
             if empty_records == 2 {
                 loop {

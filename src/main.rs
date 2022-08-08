@@ -221,68 +221,66 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    #[test]
-    #[serial]
-    fn test_extract_auto_zstd() {
+    fn test_extraction<F: FnOnce(&str) -> R + std::panic::UnwindSafe, R>(ident: &str, f: F) 
+    {
+        // git cannot contain true empty directory, hence we need to store the test directories
+        // in tarball and extract them if they are not extracted yet
+        let before_path = std::path::PathBuf::from("test-materials/stage-before");
+        let expected_path = std::path::PathBuf::from("test-materials/stage-expected");
+        if !before_path.exists() {
+            std::process::Command::new("tar")
+                .arg("xf").arg("test-materials/stage-before.tar").arg("-C").arg("test-materials")
+                .output().unwrap();
+        }
+        if !expected_path.exists() {
+            std::process::Command::new("tar")
+                .arg("xf").arg("test-materials/stage-expected.tar").arg("-C").arg("test-materials")
+                .output().unwrap();
+        }
         let current_dir = std::env::current_dir().unwrap();
-        _ = std::fs::remove_dir_all("test-materials/stagez");
+        let stage_dir = format!("test-materials/stage-{ident}");
+        // ensure we have a clean environment
+        _ = std::fs::remove_dir_all(&stage_dir);
+        std::process::Command::new("cp").arg("-r")
+            .arg("test-materials/stage-before")
+            .arg(&stage_dir).output().unwrap();
 
         let result = std::panic::catch_unwind(|| {
-            println!("{}", std::env::current_dir().unwrap().to_string_lossy());
-            std::process::Command::new("cp").arg("-r")
-                .arg("test-materials/stage_template")
-                .arg("test-materials/stagez")
-                .output().unwrap();
-            let extract_arg = ExtractArgs { chdir: Some("test-materials/stagez".to_string())
-                                          , file: "test-materials/base.tar.zst".to_string()
-                                          , zstd: false };
-            do_extract(extract_arg).unwrap();
-
+            f(&stage_dir);
+            _ = std::env::set_current_dir(current_dir);
             let output = std::process::Command::new("diff").arg("-r")
-                .arg("../stagez")
-                .arg("../stage-expected").output().unwrap();
-            println!("stdout: {:?}", std::str::from_utf8(&output.stdout));
-            println!("stderr: {:?}", std::str::from_utf8(&output.stderr));
+                .arg(&stage_dir)
+                .arg("test-materials/stage-expected").output().unwrap();
+                println!("stdout: {:?}", std::str::from_utf8(&output.stdout));
+                println!("stderr: {:?}", std::str::from_utf8(&output.stderr));
 
             assert!(output.stdout.is_empty());
             assert!(output.stderr.is_empty());
         });
-
-        _ = std::env::set_current_dir(current_dir);
-        _ = std::fs::remove_dir_all("test-materials/stagez");
+        _ = std::fs::remove_dir_all(&stage_dir);
         assert!(result.is_ok())
     }
 
     #[test]
     #[serial]
-    fn test_extract() {
-        let current_dir = std::env::current_dir().unwrap();
-        _ = std::fs::remove_dir_all("test-materials/stage");
+    fn test_extract_auto_zstd() {
+        test_extraction("zstd", |dir| {
+            let extract_arg = ExtractArgs { chdir: Some(dir.to_string())
+                                          , file: "test-materials/base.tar.zst".to_string()
+                                          , zstd: false };
+            do_extract(extract_arg).unwrap();
+        });
+    }
 
-        let result = std::panic::catch_unwind(|| {
-            println!("{}", std::env::current_dir().unwrap().to_string_lossy());
-            std::process::Command::new("cp").arg("-r")
-                .arg("test-materials/stage_template")
-                .arg("test-materials/stage")
-                .output().unwrap();
-            let extract_arg = ExtractArgs { chdir: Some("test-materials/stage".to_string())
+    #[test]
+    #[serial]
+    fn test_extract() {
+        test_extraction("normal", |dir| {
+            let extract_arg = ExtractArgs { chdir: Some(dir.to_string())
                                           , file: "test-materials/base.tar".to_string()
                                           , zstd: false };
             do_extract(extract_arg).unwrap();
-
-            let output = std::process::Command::new("diff").arg("-r")
-                .arg("../stage")
-                .arg("../stage-expected").output().unwrap();
-            println!("stdout: {:?}", std::str::from_utf8(&output.stdout));
-            println!("stderr: {:?}", std::str::from_utf8(&output.stderr));
-
-            assert!(output.stdout.is_empty());
-            assert!(output.stderr.is_empty());
         });
-
-        _ = std::env::set_current_dir(current_dir);
-        _ = std::fs::remove_dir_all("test-materials/stage");
-        assert!(result.is_ok())
     }
 }
 
