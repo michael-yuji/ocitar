@@ -40,15 +40,8 @@ impl<R: Read> Read for PrebufferedSource<R> {
             buf[..from_buf].copy_from_slice(&self.buffer[..from_buf]);
             self.buffer = self.buffer[from_buf..].to_vec();
         }
-
-        eprintln!("from_buf: {from_buf}");
-        eprintln!("required_buf_size: {}", buf.len());
         let cnt = self.source.read(&mut buf[from_buf..])?;
         Ok(cnt + from_buf)
-        /*
-        self.source.read_exact(&mut buf[from_buf..])?;
-        Ok(buf.len())
-        */
     }
 }
 
