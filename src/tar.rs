@@ -59,8 +59,7 @@ impl RawTarHeader
     }
 
     /// Get the path of this header, if the header is *not* a ustar header, this
-    /// is same of `name`, otherwise if the header is a ustar header and this prefix
-    /// is not null, this is {prefix}/{name}
+    /// is same as the `name` field
     pub fn file_path(&self) -> std::io::Result<std::path::PathBuf> {
         let mut path = str_from_nul_bytes_buf(&self.name)?.to_string();
         if self.is_ustar_header() && self.prefix != [0u8; 155] {
@@ -70,7 +69,7 @@ impl RawTarHeader
         Ok(std::path::PathBuf::from(path))
     }
 
-    /// Get the content length of this header
+    /// Size of the content the header represents
     pub fn content_length(&self) -> std::io::Result<u128> {
         // If the size field starts with 0xff, the size is encoded in base256
         if self.size[0] == 0xff {
@@ -498,7 +497,7 @@ fn tap_foreach_entry<R: Read, H: TarEntryHandle>(reader: &mut R, handle: &mut H)
     Ok(())
 }
 
-// read from a tar and pass to stdin of a real tar process
+// read from a tar and pass to the stdin of a real tar process
 pub fn tap_extract_tar<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
 {
     let mut extractor = ExtractTar { writer };
