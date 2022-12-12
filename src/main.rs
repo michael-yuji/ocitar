@@ -6,19 +6,21 @@ use crate::util::*;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::Command;
-use zstd::{Decoder, Encoder};
+use zstd::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
 const ZSTD_MAGIC: [u8;4] = [0x28, 0xb5, 0x2f, 0xfd];
+const GZIP_MAGIC: [u8;2] = [0x1f, 0x8b];
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
     #[clap(short, parse(from_occurrences))]
     verbosity: usize,
+    #[clap(long = "dry-run", default_value_t, action)]
+    dry_run: bool,
     #[clap(subcommand)]
     command: Commands
 }
-
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -28,6 +30,27 @@ enum Commands {
     List(ListArgs),
     #[clap(short_flag = 'x')]
     Extract(ExtractArgs)
+}
+
+#[derive(Debug)]
+enum CompressionType {
+    Auto,
+    None,
+    Zstd,
+    Gzip
+}
+
+impl std::str::FromStr for CompressionType {
+    type Err = std::io::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "none" => Ok(Self::None),
+            "zstd" => Ok(Self::Zstd),
+            "gzip" => Ok(Self::Gzip),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "unknown value"))
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -41,21 +64,27 @@ pub struct CreateArgs
     #[clap(long, multiple_occurrences = true)]
     remove: Vec<String>,
 
-    /// paths to include in the layer archive
+    /// paths to include in the layer archive, when "--zfs-diff" is set, these define
+    /// the 2 ZFS snapshot / dataset to be diff, in the order zfs-diff(8) accepts
     #[clap(multiple = true)]
     paths: Vec<String>,
 
-    /// create ZStandard compressed tar archive
-    #[clap(long)]
-    zstd: bool,
+    /// Types of compression to be use, available compressions are zstd and gzip
+    #[clap(long, default_value="auto")]
+    compression: CompressionType,
+
+    /// If this flag is set, the utility create an archive with the difference between the two zfs
+    /// datasets
+    #[clap(long = "zfs-diff", action)]
+    zfs_diff: bool,
 
     /// Do not create OCI whiteout files. Use this program's custom tar extension only
     #[clap(long = "no-oci")]
     without_oci: bool,
 
-    /// Do not include this program's custom tar extension to the archive
+    /// Include this program's custom tar extension to the archive
     #[clap(long = "no-ext")]
-    without_ext: bool
+    with_ext: bool
 }
 
 #[derive(Parser, Debug)]
@@ -64,17 +93,17 @@ pub struct ListArgs {
     #[clap(short)]
     file: String,
 
-    /// use if the archive is zstd compressed
-    #[clap(long)]
-    zstd: bool
+    /// specify the compression type the archive is compressed in, if set to auto, which is the
+    /// default, the type of compression will be guessed by the first 4 bytes of the file
+    #[clap(long, default_value="auto")]
+    compression: CompressionType,
 }
 
 #[derive(Parser, Debug)]
 pub struct ExtractArgs {
 
-    /// use if the archive is zstd compressed
-    #[clap(long)]
-    zstd: bool,
+    #[clap(long, default_value="auto")]
+    compression: CompressionType,
 
     /// change directory to the location before extracting
     #[clap(short = 'C')]
@@ -85,6 +114,26 @@ pub struct ExtractArgs {
     file: String
 }
 
+fn prepare_compressed_stream_reader(mut input: Box<dyn Read>, hint: CompressionType) -> Result<Box<dyn Read>, std::io::Error> {
+
+    match hint {
+        CompressionType::Auto => {
+            let mut check_magic = [0u8; 4];
+            input.read_exact(&mut check_magic)?;
+            if check_magic == ZSTD_MAGIC {
+                Ok(Box::new(ZstdDecoder::new(PrebufferedSource::new(&check_magic, input))?))
+            } else if check_magic[..2] == GZIP_MAGIC {
+                Ok(Box::new(flate2::read::GzDecoder::new(PrebufferedSource::new(&check_magic, input))))
+            } else {
+                Ok(Box::new(PrebufferedSource::new(&check_magic, input)))
+            }
+        },
+        CompressionType::None => Ok(input),
+        CompressionType::Zstd => Ok(Box::new(ZstdDecoder::new(input)?)),
+        CompressionType::Gzip => Ok(Box::new(flate2::read::GzDecoder::new(input)))
+    }
+}
+
 pub fn do_list(args: ListArgs) -> Result<(), std::io::Error>
 {
     let mut input: Box<dyn Read> = match args.file.as_str() {
@@ -92,17 +141,7 @@ pub fn do_list(args: ListArgs) -> Result<(), std::io::Error>
         path => Box::new(File::open(path)?)
     };
 
-    if args.zstd {
-        input = Box::new(Decoder::new(input)?);
-    } else {
-        let mut check_magic = [0u8; 4];
-        input.read_exact(&mut check_magic)?;
-        if check_magic == ZSTD_MAGIC {
-            input = Box::new(Decoder::new(PrebufferedSource::new(&check_magic, input))?);
-        } else {
-            input = Box::new(PrebufferedSource::new(&check_magic, input));
-        }
-    }
+    input = prepare_compressed_stream_reader(input, args.compression)?;
 
     let summary = tar::list_tar(&mut input)?;
 
@@ -117,6 +156,16 @@ pub fn do_list(args: ListArgs) -> Result<(), std::io::Error>
     Ok(())
 }
 
+fn zfs_dataset_get_mountpoint(dataset: &String) -> Result<Option<String>, std::io::Error> {
+    let dataset = match dataset.split_once(if dataset.contains('#') { '#' } else { '@' }) {
+        None => dataset.to_string(),
+        Some((origin, _)) => origin.to_string()
+    };
+    let out = std::process::Command::new("zfs").arg("get").arg("-Ho").arg("value").arg("mountpoint").arg(dataset).output()?.stdout;
+    let mountpoint = std::str::from_utf8(&out).unwrap().trim().to_string();
+    Ok(if mountpoint == "-" { None } else { Some(mountpoint) })
+}
+
 pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
 
     let mut output: Box<dyn Write> = match args.file.as_str() {
@@ -124,11 +173,51 @@ pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
         path => Box::new(File::create(path)?)
     };
 
-    if args.zstd {
-        output = Box::new(Encoder::new(output, 3)?.auto_finish());
-    }
+    output = match args.compression {
+        CompressionType::Zstd => Box::new(ZstdEncoder::new(output, 3)?.auto_finish()),
+        CompressionType::Gzip => Box::new(flate2::write::ZlibEncoder::new(output, flate2::Compression::default())),
+        _ => output,
+    };
 
-    create_tar(args.without_oci, args.without_ext, &args.paths, &args.remove, &mut output)
+    if args.zfs_diff {
+        if args.paths.len() != 2 {
+            panic!("zfs diff accepts two and only two arguments")
+        }
+
+        let mut adding = Vec::new();
+        let mut removing = Vec::new();
+
+        let root = zfs_dataset_get_mountpoint(&args.paths[1])?.unwrap();
+
+        let out = std::process::Command::new("zfs")
+            .arg("diff").arg("-H")
+            .arg(&args.paths[0])
+            .arg(&args.paths[1]).output()?;
+
+        let stdout = std::str::from_utf8(&out.stdout).unwrap();
+
+        for line in stdout.lines() {
+            let mut columns = line.split('\t');//.collect::<Vec<_>>();
+            let flag = columns.next().expect("Expect flag");
+            let path = columns.next().expect("Expect path").to_string()
+                .replacen(&root, "", 1);
+
+            match flag {
+                "-" => removing.push(path),
+                "+" =>   adding.push(path),
+                "M" =>   adding.push(path),
+                "R" => {
+                    let new = columns.next().expect("expect new path").to_string();
+                    removing.push(path.to_string());
+                    adding.push(new.replacen(&path, "", 1))
+                },
+                _ => unreachable!()
+            }
+        }
+        create_tar(args.without_oci, !args.with_ext, &["-C".to_string(), root], &adding, &removing, &mut output)
+    } else {
+        create_tar(args.without_oci, !args.with_ext, &[], &args.paths, &args.remove, &mut output)
+    }
 }
 
 pub fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
@@ -138,22 +227,11 @@ pub fn do_extract(args: ExtractArgs) -> Result<(), std::io::Error>
         path => Box::new(File::open(path)?)
     };
 
-    if args.zstd {
-        input = Box::new(Decoder::new(input)?);
-    } else {
-        let mut check_magic = [0u8; 4];
-        input.read_exact(&mut check_magic)?;
-        if check_magic == ZSTD_MAGIC {
-            input = Box::new(Decoder::new(PrebufferedSource::new(&check_magic, input))?);
-        } else {
-            input = Box::new(PrebufferedSource::new(&check_magic, input));
-        }
-    }
+    input = prepare_compressed_stream_reader(input, args.compression)?;
 
     if let Some(dir) = args.chdir {
         std::env::set_current_dir(dir)?;
     }
-println!("148");
     extract(&mut input)
 }
 
@@ -176,9 +254,11 @@ fn extract<R: Read>(reader: &mut R) -> Result<(), std::io::Error>
 
 fn create_tar<W: Write>(
     without_oci: bool, without_ext: bool, 
-    paths: &[String], whiteouts: &[String], output: &mut W) -> Result<(), std::io::Error>
+    tar_options: &[String],
+    paths: &[String], whiteouts: &[String],
+    output: &mut W) -> Result<(), std::io::Error>
 {
-    let mut child = Command::new("tar").arg("-cf-").args(paths)
+    let mut child = Command::new("tar").args(tar_options).arg("-cf-").args(paths)
         .stdout(std::process::Stdio::piped())
         .spawn()?;
     let tar_stdout = child.stdout.as_mut().unwrap();
@@ -202,9 +282,13 @@ fn main() -> Result<(), std::io::Error> {
 
     let args = Args::parse();
 
+    if args.dry_run {
+        eprintln!("{args:#?}");
+        return Ok(())
+    }
+
     // setup logging facility
     stderrlog::new().module(module_path!()).verbosity(args.verbosity).init().unwrap();
-
 
     log::debug!("main args: {args:?}");
 
@@ -267,7 +351,7 @@ mod tests {
         test_extraction("zstd", |dir| {
             let extract_arg = ExtractArgs { chdir: Some(dir.to_string())
                                           , file: "test-materials/base.tar.zst".to_string()
-                                          , zstd: false };
+                                          , compression: CompressionType::Auto };
             do_extract(extract_arg).unwrap();
         });
     }
@@ -278,7 +362,7 @@ mod tests {
         test_extraction("normal", |dir| {
             let extract_arg = ExtractArgs { chdir: Some(dir.to_string())
                                           , file: "test-materials/base.tar".to_string()
-                                          , zstd: false };
+                                          , compression: CompressionType::Auto};
             do_extract(extract_arg).unwrap();
         });
     }
