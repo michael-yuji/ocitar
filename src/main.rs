@@ -122,7 +122,7 @@ fn prepare_compressed_stream_reader(mut input: Box<dyn Read>, hint: CompressionT
             input.read_exact(&mut check_magic)?;
             if check_magic == ZSTD_MAGIC {
                 Ok(Box::new(ZstdDecoder::new(PrebufferedSource::new(&check_magic, input))?))
-            } else if check_magic[..2] == GZIP_MAGIC {
+            } else if check_magic[0..2] == GZIP_MAGIC {
                 Ok(Box::new(flate2::read::GzDecoder::new(PrebufferedSource::new(&check_magic, input))))
             } else {
                 Ok(Box::new(PrebufferedSource::new(&check_magic, input)))
@@ -175,7 +175,7 @@ pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
 
     output = match args.compression {
         CompressionType::Zstd => Box::new(ZstdEncoder::new(output, 3)?.auto_finish()),
-        CompressionType::Gzip => Box::new(flate2::write::ZlibEncoder::new(output, flate2::Compression::default())),
+        CompressionType::Gzip => Box::new(flate2::write::GzEncoder::new(output, flate2::Compression::default())),
         _ => output,
     };
 
@@ -187,7 +187,7 @@ pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
         let mut adding = Vec::new();
         let mut removing = Vec::new();
 
-        let root = zfs_dataset_get_mountpoint(&args.paths[1])?.unwrap();
+        let root = format!("{}/", zfs_dataset_get_mountpoint(&args.paths[1])?.unwrap());
 
         let out = std::process::Command::new("zfs")
             .arg("diff").arg("-H")
@@ -214,6 +214,7 @@ pub fn do_create(args: CreateArgs) -> Result<(), std::io::Error> {
                 _ => unreachable!()
             }
         }
+
         create_tar(args.without_oci, !args.with_ext, &["-C".to_string(), root], &adding, &removing, &mut output)
     } else {
         create_tar(args.without_oci, !args.with_ext, &[], &args.paths, &args.remove, &mut output)
@@ -258,9 +259,20 @@ fn create_tar<W: Write>(
     paths: &[String], whiteouts: &[String],
     output: &mut W) -> Result<(), std::io::Error>
 {
-    let mut child = Command::new("tar").args(tar_options).arg("-cf-").args(paths)
+    let paths_input = paths.join("\n");
+    let mut child = Command::new("tar").args(tar_options).arg("-cf-").arg("-T-")//.args(paths)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()?;
+
+    let mut child_stdin = child.stdin.take().unwrap();
+
+    std::thread::spawn(move ||
+    {
+        _ = child_stdin.write_all(paths_input.as_bytes());
+        drop(child_stdin);
+    });
+
     let tar_stdout = child.stdout.as_mut().unwrap();
 
     tar::tap_create_tar(without_oci, without_ext, whiteouts, tar_stdout, output)?;
